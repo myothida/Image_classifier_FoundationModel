@@ -1,86 +1,57 @@
-import numpy as np
 import torch
 from torch import nn
-from torch import optim
-from torchvision import datasets, transforms, models
+from torchvision import models, transforms
 from PIL import Image
-import json
-from collections import OrderedDict
-from time import time
 import argparse
+import json
+import numpy as np
+from collections import OrderedDict
 import matplotlib.pyplot as plt
 import seaborn as sb
 
-# Creates Argument Parser object named parser
-parser = argparse.ArgumentParser()
-
-parser.add_argument('image_path', type = str, default = './data/flower_data/test/1/image_06743.jpg',
-                    help = 'Provide the path to a singe image (required)')
-parser.add_argument('save_path', type = str, default = "./models/checkpoint.pth",
-                    help = 'Provide the path to the file of the trained model (required)')
-
-parser.add_argument('--category_names', type = str, default = 'cat_to_name.json',
-                    help = 'Use a mapping of categories to real names')
-parser.add_argument('--top_k', type = int, default = 5,
-                    help = 'Return top K most likely classes. Default value is 5')
-# GPU
-parser.add_argument('--gpu', action='store_true',
-                    help = "Add to activate CUDA")
-
-args_in = parser.parse_args()
-
-
-
-if args_in.gpu:
-    device = torch.device("cuda")
-    print("****** CUDA activated ****************************")
-else:
-    device = torch.device("cpu")
-
+def process_image(image_path):
+    """
+    Preprocesses the image for the model.
+    """
+    img = Image.open(image_path)
+    preprocess = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    processed_img = np.array(preprocess(img))
+    return preprocess(img)
 
 def load_checkpoint(filepath):
-    checkpoint = torch.load(filepath)
+    checkpoint = torch.load(filepath, weights_only=True)  
+    input_size = checkpoint['input_size']
+    output_size = checkpoint['output_size']
+    hidden_layers = checkpoint['hidden_layers']
+    model = models.resnet50(weights='IMAGENET1K_V1')
+    # Recreate the model with nn.Sequential based on the saved architecture
+    model.classifier = nn.Sequential(OrderedDict([
+                          ('fc1', nn.Linear(input_size, hidden_layers[0])),
+                          ('relu', nn.ReLU()),
+                          ('dropout', nn.Dropout(0.2)),
+                          ('fc2', nn.Linear(hidden_layers[0], output_size)),
+                          ('output', nn.LogSoftmax(dim=1))
+                          ]))
     
-    if checkpoint['arch'] == 'resnet50':
-        model = models.resnet50(weights='IMAGENET1K_V1')
-    elif checkpoint['arch'] == 'vgg13':
-        model = models.vgg13(pretrained = True)
-    else:
-        raise ValueError('Model arch error.')
-
-    for param in model.parameters():
-        param.requires_grad = False
-        
-    model.classifier = checkpoint['classifier']
+    # Load the saved model state_dict (weights)
     model.load_state_dict(checkpoint['model_state_dict'])
-    model.class_to_idx = checkpoint['class_to_idx']
     
-    # Set the model to evaluation mode (optional, but recommended for inference)
     model.eval()
 
     return model
 
-checkpoint_path = args_in.save_path
-model = load_checkpoint(checkpoint_path)
-model.to(device)
-
-
-def process_image(image):
-    ''' Scales, crops, and normalizes a PIL image for a PyTorch model,
-        returns an Numpy array
-    '''
-    img = Image.open(image)
-
-    preprocess = transforms.Compose([
-    transforms.Resize(256),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    processed_img = np.array(preprocess(img))
-    return processed_img
-
+def predict(image_path, model, topk=5):
+    model.eval()
+    img = process_image(image_path).unsqueeze_(0)
+    with torch.no_grad():
+        output = model(img)        
+        top_p, top_class = output.topk(topk, dim=1)
+    return top_p.numpy()[0], top_class.numpy()[0]
 
 def imshow(image, ax=None, title=None):
     """Imshow for Tensor."""
@@ -89,7 +60,8 @@ def imshow(image, ax=None, title=None):
     
     # PyTorch tensors assume the color channel is the first dimension
     # but matplotlib assumes is the third dimension
-    image = image.transpose((1, 2, 0))
+    image = image.permute(1, 2, 0).numpy() 
+    #image = image.transpose((1, 2, 0))
     
     # Undo preprocessing
     mean = np.array([0.485, 0.456, 0.406])
@@ -103,54 +75,37 @@ def imshow(image, ax=None, title=None):
     
     return ax
 
-def predict(image_path, model, topk=5):
-    ''' Predict the class (or classes) of an image using a trained deep learning model.
-    '''
-    image = process_image(image_path)
-    image = torch.from_numpy(image).type(torch.FloatTensor)
-    image = image.unsqueeze(0) 
-    image = image.to(device)
-    
-    # TODO: Implement the code to predict the class from an image file
-    model.eval()
-    with torch.no_grad ():
-        output = model.forward(image)
-    print("Model Output (Log-Probabilities):", output)
-    #output_prob = torch.exp(output)    
-    probs, indeces = output.topk(topk)    
-    probs =  probs.cpu().numpy().tolist()[0]    
-    indeces = indeces.cpu().numpy().tolist()[0]
-    
-    mapping = {val: key for key, val in model.class_to_idx.items()}
-    classes = [mapping[item] for item in indeces]
-    
-    return probs, classes
+
+parser = argparse.ArgumentParser(description='Predict flower name from an image.')
+parser.add_argument('image_path', type=str, default = './data/flower_data/test/1/image_06743.jpg', help='Path to the input image.')
+parser.add_argument('checkpoint', type=str, default = './models/resNet50_model_script.pth', help='Path to the model.')
+parser.add_argument('--top_k', type=int, default=5, help='Return top K most likely classes.')
+parser.add_argument('--category_names', type=str, default = 'cat_to_name.json', help='Path to a JSON file mapping categories to real names.')
+args = parser.parse_args()
+
+model = load_checkpoint(args.checkpoint)
 
 
-image_path = args_in.image_path
-top_k      = args_in.top_k
-
-probs, classes = predict(image_path, model, topk=top_k)
-
-if args_in.category_names:
-    with open('cat_to_name.json', 'r') as f:
+if args.category_names:
+    with open(args.category_names, 'r') as f:
         cat_to_name = json.load(f)
-    names = [cat_to_name[key] for key in classes]
-    print("Class name:")
-    print(names)
-### ------------------------------------------------------------
+else:
+    cat_to_name = None
 
-print("Class number:")
-print(classes)
-print("Probability (%):")
+probs, classes = predict(args.image_path, model, args.top_k)
 for idx, item in enumerate(probs):
     probs[idx] = round(item/100, 2)
+
+names = [cat_to_name[str(key+1)] for key in classes]
+
 print(probs)
+print(classes)
+print(names)
 
 plt.figure(figsize = (6,10))
 
 ax    = plt.subplot(2,1,1)
-image = process_image(image_path)
+image = process_image(args.image_path)
 ax    = imshow(image, ax=ax, title=names[0])
 ax.axis('off')
 
@@ -158,9 +113,3 @@ plt.subplot(2,1,2)
 sb.barplot(x=probs, y=names, color=sb.color_palette()[0])
 
 plt.show()
-
-
-# command line usage: 
-# python predict.py ./data/flower_data/test/1/image_06743.jpg ./model/checkpoint.pth --gpu
-# python predict.py ./data/flower_data/test/1/image_06743.jpg ./model/checkpoint.pth --category_names cat_to_name.json --top_k 5
-# python predict.py ./data/flower_data/test/1/image_06743.jpg ./model/checkpoint.pth --category_names cat_to_name.json --top_k 10 --gpu
